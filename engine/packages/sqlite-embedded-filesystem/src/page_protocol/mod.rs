@@ -17,11 +17,24 @@ pub async fn execute(
 	message: p::ToRivet,
 ) -> Result<p::ToEnvoy> {
 	let keeps_stage = keeps_refused_stage(&message);
+	let reads_pages = matches!(&message, p::ToRivet::ToRivetSqliteGetPagesRequest(_));
 	let result = async {
 		pages.refresh().await?;
 		execute_inner(stage, pages, message).await
 	}
-	.await;
+	.await
+	.map_err(|error: anyhow::Error| {
+		if reads_pages && !pages.fs.is_fenced() && matches!(
+			error.downcast_ref::<depot_client::filesystem::Error>(),
+			Some(depot_client::filesystem::Error::Log(
+				depot_volume::volume_client_machine::types::WriteError::QuorumUnavailable { token: None }
+			))
+		) {
+			error.context(PageReadRefused)
+		} else {
+			error
+		}
+	});
 	// Pre-admission refusals retain a resumable stage. Unknown outcomes must abort it.
 	let refused = result.as_ref().is_err_and(|error| refusal_hint(keeps_stage, error).is_some());
 	if result.is_err() && !refused {
@@ -47,11 +60,12 @@ pub async fn abandon_stage(stage: &mut Option<Stage>, pages: &mut database::Data
 	}
 }
 
-/// Whether `error` is a refused cold read. Every cold read of a request, a commit's included, happens before its write is
+/// Whether `error` is a refused read. Every cold read of a request, a commit's included, happens before its write is
 /// admitted, and a refusal after admission is reported as an undecided write instead, so the
-/// identical request may be sent again, against the same stage.
+/// identical request may be sent again, against the same stage. A committed page read may
+/// also be refused while its filesystem ownership remains valid.
 pub fn refused_without_running(error: &anyhow::Error) -> bool {
-	matches!(
+	error.is::<PageReadRefused>() || matches!(
 		error.downcast_ref::<depot_client::filesystem::Error>(),
 		Some(depot_client::filesystem::Error::ColdReadRefused)
 	)
@@ -60,6 +74,9 @@ pub fn refused_without_running(error: &anyhow::Error) -> bool {
 /// Retry hint for an identical page request whose staged transaction remains available.
 /// Errors with an admitted write token never qualify: their outcome may still be unknown.
 pub fn retry_after_ms(message: &p::ToRivet, error: &anyhow::Error) -> Option<u64> {
+	if error.is::<PageReadRefused>() && !matches!(message, p::ToRivet::ToRivetSqliteGetPagesRequest(_)) {
+		return None;
+	}
 	refusal_hint(keeps_refused_stage(message), error)
 }
 
@@ -72,6 +89,9 @@ fn keeps_refused_stage(message: &p::ToRivet) -> bool {
 }
 
 fn refusal_hint(keeps_stage: bool, error: &anyhow::Error) -> Option<u64> {
+	if keeps_stage && error.is::<PageReadRefused>() {
+		return depot_client::filesystem::Error::Overloaded.retry_after_ms();
+	}
 	let error = error.downcast_ref::<depot_client::filesystem::Error>()?;
 	if keeps_stage || *error == depot_client::filesystem::Error::ColdReadRefused {
 		error.retry_after_ms()
@@ -79,6 +99,15 @@ fn refusal_hint(keeps_stage: bool, error: &anyhow::Error) -> Option<u64> {
 		None
 	}
 }
+
+#[derive(Debug)]
+struct PageReadRefused;
+impl std::fmt::Display for PageReadRefused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("committed SQLite page read temporarily unavailable")
+	}
+}
+impl std::error::Error for PageReadRefused {}
 
 async fn execute_inner(
 	stage: &mut Option<stage::Stage>,

@@ -13,6 +13,7 @@ async-trait.workspace = true
 bytes.workspace = true
 depot-client.workspace = true
 depot-fs-core.workspace = true
+depot-volume.workspace = true
 futures-util.workspace = true
 rivet-env.workspace = true
 rivet-envoy-protocol.workspace = true
@@ -26,7 +27,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 depot-types.workspace = true
-depot-volume.workspace = true
 rivet-data.workspace = true
 vbare.workspace = true
 

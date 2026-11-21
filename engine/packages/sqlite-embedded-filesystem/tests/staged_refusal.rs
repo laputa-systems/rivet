@@ -18,6 +18,10 @@ struct Log {
     attempts: AtomicUsize,
     held_committed: AtomicU64,
     settle_on_barrier: AtomicBool,
+    read_error: Mutex<Option<fs::Error>>,
+    fence_on_read: AtomicBool,
+    fail_admit: AtomicBool,
+    reads: AtomicUsize,
 }
 
 fn position(sequence: u64) -> VolumeLogPosition {
@@ -52,9 +56,31 @@ impl Journal for Log {
                 empty: entries.is_empty(), complete: true, entries })
         })
     }
+    fn read(&self, first: u64, max_bytes: usize) -> BoxFuture<'_, fs::Result<LogHistory>> {
+        Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.read_error.lock().unwrap().clone() {
+                if self.fence_on_read.load(Ordering::SeqCst) {
+                    self.fenced.store(true, Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+            let mut history = self.recover().await?;
+            let mut bytes = 0;
+            history.entries.retain(|entry| {
+                if entry.volume_seq < first { return false; }
+                bytes += depot_types::log_shard::entry_bytes(entry) as usize;
+                bytes <= max_bytes
+            });
+            Ok(history)
+        })
+    }
     fn admit(&self, payload: vbare::Bytes) -> BoxFuture<'_, fs::Result<WriteOutcome>> {
         Box::pin(async move {
             self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_admit.load(Ordering::SeqCst) {
+                return Err(fs::Error::Log(WriteError::QuorumUnavailable { token: None }));
+            }
             if self.refuse.load(Ordering::SeqCst) {
                 return Err(fs::Error::Log(WriteError::Overloaded { retry_after_ms: 275, token: None }));
             }
@@ -231,4 +257,102 @@ fn admitted_overload_never_allows_a_new_staged_request() {
             assert_eq!(page_protocol::retry_after_ms(&message, &error.into()), None);
         }
     }
+}
+
+async fn staged_database_with_committed_page(log: &Arc<Log>) -> (Database, Option<page_protocol::Stage>, u64) {
+    let config = fs::Config { max_cache_bytes: 0, ..fs::Config::default() };
+    let filesystem = fs::Filesystem::open_staging_empty(log.clone(), Arc::new(NoColdReads),
+        Arc::new(rivet_env::TokioClock::new().unwrap()), config, None,
+        OpenPrefetch::default()).await.unwrap();
+    let mut database = Database::from_filesystem(filesystem).await.unwrap();
+    database.set_server_prefetch(false);
+    let mut stage = None;
+    let base = database.root.txid;
+    page_protocol::execute(&mut stage, &mut database, begin(base)).await.unwrap();
+    page_protocol::execute(&mut stage, &mut database, segment(base + 1)).await.unwrap();
+    page_protocol::execute(&mut stage, &mut database, finalize(base + 1)).await.unwrap();
+    let committed = database.root.txid;
+    page_protocol::execute(&mut stage, &mut database, begin(committed)).await.unwrap();
+    page_protocol::execute(&mut stage, &mut database, segment(committed + 1)).await.unwrap();
+    assert!(database.fs.try_release_idle_caches());
+    (database, stage, committed)
+}
+
+fn read_page(committed: u64) -> p::ToRivet {
+    p::ToRivet::ToRivetSqliteGetPagesRequest(p::ToRivetSqliteGetPagesRequest {
+        request_id: 4, data: p::SqliteGetPagesRequest { actor_id: "test".into(), pgnos: vec![1],
+            expected_generation: None, expected_head_txid: Some(committed) },
+    })
+}
+
+#[tokio::test]
+async fn a_temporary_committed_page_read_keeps_the_stage_without_replaying_writes() {
+    let log = Arc::new(Log::default());
+    let (mut database, mut stage, committed) = staged_database_with_committed_page(&log).await;
+    let request = read_page(committed);
+    let attempts = log.attempts.load(Ordering::SeqCst);
+    let reads = log.reads.load(Ordering::SeqCst);
+    *log.read_error.lock().unwrap() = Some(fs::Error::Log(WriteError::QuorumUnavailable { token: None }));
+    let error = page_protocol::execute(&mut stage, &mut database, request.clone()).await.unwrap_err();
+    assert!(log.reads.load(Ordering::SeqCst) > reads, "the real page read must reach the failing journal");
+    assert_eq!(page_protocol::retry_after_ms(&request, &error), Some(100));
+    assert!(page_protocol::refused_without_running(&error));
+    assert!(matches!(error.downcast_ref::<fs::Error>(),
+        Some(fs::Error::Log(WriteError::QuorumUnavailable { token: None }))));
+    assert_eq!(page_protocol::retry_after_ms(&segment(committed + 1), &error), None);
+    assert!(stage.is_some(), "a failed read must retain the existing staged transaction");
+    assert!(!database.fs.is_fenced());
+    assert_eq!(log.attempts.load(Ordering::SeqCst), attempts, "a failed read must not admit an abort or another write");
+    *log.read_error.lock().unwrap() = None;
+    let response = page_protocol::execute(&mut stage, &mut database, request).await.unwrap();
+    let p::ToEnvoy::ToEnvoySqliteGetPagesResponse(response) = response else { panic!("page response"); };
+    let p::SqliteGetPagesResponse::SqliteGetPagesOk(data) = response.data else { panic!("successful page response"); };
+    assert_eq!(data.head_txid, Some(committed));
+    assert_eq!(data.pages.len(), 1);
+    assert_eq!(data.pages[0].bytes.as_deref(), Some(&[42u8; 4096][..]));
+    assert_eq!(log.attempts.load(Ordering::SeqCst), attempts);
+    page_protocol::execute(&mut stage, &mut database, finalize(committed + 1)).await.unwrap();
+    assert!(stage.is_none());
+    assert!(!database.fs.is_fenced());
+}
+
+#[tokio::test]
+async fn page_reads_do_not_retry_admitted_outcomes_or_lost_ownership() {
+    let token = WriteToken { payload_digest: [3; 16], volume_incarnation: [1; 16],
+        client_seq: 2, request_id: [2; 16] };
+    for (error, fence) in [
+        (fs::Error::Log(WriteError::QuorumUnavailable { token: Some(token) }), false),
+        (fs::Error::Log(WriteError::QuorumUnavailable { token: None }), true),
+        (fs::Error::Fenced, true),
+    ] {
+        let log = Arc::new(Log::default());
+        let (mut database, mut stage, committed) = staged_database_with_committed_page(&log).await;
+        let request = read_page(committed);
+        let reads = log.reads.load(Ordering::SeqCst);
+        *log.read_error.lock().unwrap() = Some(error.clone());
+        log.fence_on_read.store(fence, Ordering::SeqCst);
+        let actual = page_protocol::execute(&mut stage, &mut database, request.clone()).await.unwrap_err();
+        assert!(log.reads.load(Ordering::SeqCst) > reads);
+        assert_eq!(actual.downcast_ref::<fs::Error>(), Some(&error));
+        assert_eq!(page_protocol::retry_after_ms(&request, &actual), None);
+        assert!(!page_protocol::refused_without_running(&actual));
+        assert!(stage.is_none(), "uncertain or fenced errors must abort the stage");
+        if fence { assert!(database.fs.is_fenced()); }
+    }
+}
+
+#[tokio::test]
+async fn a_tokenless_quorum_error_during_a_write_is_not_a_read_refusal() {
+    let log = Arc::new(Log::default());
+    let (mut database, mut stage, committed) = staged_database_with_committed_page(&log).await;
+    log.fail_admit.store(true, Ordering::SeqCst);
+    let attempts = log.attempts.load(Ordering::SeqCst);
+    let request = finalize(committed + 1);
+    let error = page_protocol::execute(&mut stage, &mut database, request.clone()).await.unwrap_err();
+    assert!(matches!(error.downcast_ref::<fs::Error>(),
+        Some(fs::Error::Log(WriteError::QuorumUnavailable { token: None }))));
+    assert_eq!(page_protocol::retry_after_ms(&request, &error), None);
+    assert!(!page_protocol::refused_without_running(&error));
+    assert!(stage.is_none());
+    assert!(log.attempts.load(Ordering::SeqCst) > attempts, "the failure must come from write admission");
 }
