@@ -42,6 +42,10 @@ pub(super) async fn execute(
 					bytes: 0,
 					prefetch: pages.prefetcher.commit_builder(),
 				});
+				// Acquiring the transaction can settle an older undecided commit. Its inode
+				// footprint now excludes another writer, so validate the base after that wait.
+				pages.refresh().await?;
+				super::check_head(Some(base), pages.root.txid)?;
 			}
 			Ok(p::ToEnvoy::ToEnvoySqliteCommitStageBeginResponse(
 				p::ToEnvoySqliteCommitStageBeginResponse {

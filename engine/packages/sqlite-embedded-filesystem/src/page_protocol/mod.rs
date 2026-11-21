@@ -7,10 +7,10 @@ use anyhow::{Result, ensure};
 use rivet_envoy_protocol as p;
 pub use stage::Stage;
 
-/// Runs one request against the database. The request reads the file's head once, here, and
-/// every check, read and commit in it uses that head; a commit then carries its own new head,
-/// so nothing in a request reads the inode again. The caller serializes requests and owns the
-/// volume, so the head cannot move under a request; the next request reads it afresh.
+/// Runs one request against the database. Requests read the committed head before checking
+/// it. A new stage reads it again after acquiring its transaction, since acquisition can
+/// settle an earlier undecided commit. Commits carry their own new head. The caller
+/// serializes requests and owns the volume.
 pub async fn execute(
 	stage: &mut Option<Stage>,
 	pages: &mut database::Database,
