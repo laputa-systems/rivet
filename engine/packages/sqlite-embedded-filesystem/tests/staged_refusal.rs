@@ -178,11 +178,17 @@ async fn stage_begin_rechecks_head_after_settling_an_undecided_commit() {
     database.refresh().await.unwrap();
     let stale_head = database.root.txid;
     log.settle_on_barrier.store(true, Ordering::SeqCst);
+    log.refuse.store(true, Ordering::SeqCst);
+    let attempts = log.attempts.load(Ordering::SeqCst);
     let error = page_protocol::execute(&mut stage, &mut database, begin(stale_head)).await
         .expect_err("stage begin must reject the head that its own barrier made stale");
     assert!(error.is::<page_protocol::HeadFenceMismatch>(), "{error:#}");
     assert!(stage.is_none());
+    assert_eq!(log.attempts.load(Ordering::SeqCst), attempts,
+        "an empty stage has no journal entries to abort");
+    assert!(!database.fs.is_fenced());
     assert!(!log.fenced.load(Ordering::SeqCst));
+    log.refuse.store(false, Ordering::SeqCst);
     database.refresh().await.unwrap();
     let committed_head = database.root.txid;
     assert!(committed_head > stale_head);
@@ -191,6 +197,25 @@ async fn stage_begin_rechecks_head_after_settling_an_undecided_commit() {
     page_protocol::execute(&mut stage, &mut database, finalize(committed_head + 1)).await.unwrap();
     assert!(stage.is_none());
     assert_eq!(database.read_pages(&[1]).await.unwrap()[0].as_deref(), Some(&[42; 4096][..]));
+}
+
+#[tokio::test]
+async fn abort_with_an_admitted_segment_still_requires_a_journal_entry() {
+    let log = Arc::new(Log::default());
+    let filesystem = fs::Filesystem::open_staging_empty(log.clone(), Arc::new(NoColdReads),
+        Arc::new(rivet_env::TokioClock::new().unwrap()), fs::Config::default(), None,
+        OpenPrefetch::default()).await.unwrap();
+    let mut database = Database::from_filesystem(filesystem).await.unwrap();
+    let mut stage = None;
+    let base = database.root.txid;
+    page_protocol::execute(&mut stage, &mut database, begin(base)).await.unwrap();
+    page_protocol::execute(&mut stage, &mut database, segment(base + 1)).await.unwrap();
+    let attempts = log.attempts.load(Ordering::SeqCst);
+    log.refuse.store(true, Ordering::SeqCst);
+    page_protocol::abandon_stage(&mut stage, &mut database).await;
+    assert!(stage.is_none());
+    assert_eq!(log.attempts.load(Ordering::SeqCst), attempts + 1);
+    assert!(database.fs.is_fenced(), "admitted data must not be discarded locally");
 }
 
 #[test]

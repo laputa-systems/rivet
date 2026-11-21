@@ -268,6 +268,13 @@ impl Filesystem {
 		crate::metrics::FS_TRANSACTION_ABORTS
 			.with_label_values(&["abort"])
 			.inc();
+		// Begin only reserves local state. Reconciliation above resolves any uncertain
+		// admission, so an empty transaction has no durable entries requiring an abort.
+		if state.transactions.get(id).is_some_and(|pending| pending.layers.is_empty()) {
+			state.transactions.remove(id);
+			self.transaction_wake.notify_waiters();
+			return Ok(());
+		}
 		// Reserved at begin, so ordinary budget pressure cannot prevent abort.
 		state
 			.transactions
