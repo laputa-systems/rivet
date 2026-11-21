@@ -16,19 +16,21 @@ pub async fn execute(
 	pages: &mut database::Database,
 	message: p::ToRivet,
 ) -> Result<p::ToEnvoy> {
+	let keeps_stage = keeps_refused_stage(&message);
 	let result = async {
 		pages.refresh().await?;
 		execute_inner(stage, pages, message).await
 	}
 	.await;
-	// A request refused without running, such as one whose cold read was refused while the
-	// tablet's maintainer moves, changed neither the stage nor its transaction, so the stage
-	// stays for the identical request to be sent again. Every other failure aborts it.
-	let refused = result.as_ref().is_err_and(refused_without_running);
-	if result.is_err() && !refused && stage::abort(stage).await.is_err() {
-		pages
-			.fs
-			.fence_with(depot_client::fences::FenceReason::StagedWriteAbortFailed);
+	// Pre-admission refusals retain a resumable stage. Unknown outcomes must abort it.
+	let refused = result.as_ref().is_err_and(|error| refusal_hint(keeps_stage, error).is_some());
+	if result.is_err() && !refused {
+		if let Err(abort_error) = stage::abort(stage).await {
+			tracing::error!(request_error = ?result.as_ref().err(), ?abort_error, "staged SQLite abort failed");
+			pages
+				.fs
+				.fence_with(depot_client::fences::FenceReason::StagedWriteAbortFailed);
+		}
 	}
 	result
 }
@@ -37,15 +39,15 @@ pub async fn execute(
 /// it, so the next staged commit starts afresh instead of meeting the stale stage. A failed
 /// abort fences the filesystem, as after any other failed request.
 pub async fn abandon_stage(stage: &mut Option<Stage>, pages: &mut database::Database) {
-	if stage::abort(stage).await.is_err() {
+	if let Err(abort_error) = stage::abort(stage).await {
+		tracing::error!(?abort_error, "abandoned SQLite stage abort failed");
 		pages
 			.fs
 			.fence_with(depot_client::fences::FenceReason::StagedWriteAbortFailed);
 	}
 }
 
-/// Whether `error` refused a request before it ran: a cold read the tablet's maintainer
-/// refused. Every cold read of a request, a commit's included, happens before its write is
+/// Whether `error` is a refused cold read. Every cold read of a request, a commit's included, happens before its write is
 /// admitted, and a refusal after admission is reported as an undecided write instead, so the
 /// identical request may be sent again, against the same stage.
 pub fn refused_without_running(error: &anyhow::Error) -> bool {
@@ -53,6 +55,29 @@ pub fn refused_without_running(error: &anyhow::Error) -> bool {
 		error.downcast_ref::<depot_client::filesystem::Error>(),
 		Some(depot_client::filesystem::Error::ColdReadRefused)
 	)
+}
+
+/// Retry hint for an identical page request whose staged transaction remains available.
+/// Errors with an admitted write token never qualify: their outcome may still be unknown.
+pub fn retry_after_ms(message: &p::ToRivet, error: &anyhow::Error) -> Option<u64> {
+	refusal_hint(keeps_refused_stage(message), error)
+}
+
+fn keeps_refused_stage(message: &p::ToRivet) -> bool {
+	matches!(message,
+		p::ToRivet::ToRivetSqliteGetPagesRequest(_)
+		| p::ToRivet::ToRivetSqliteCommitRequest(_)
+		| p::ToRivet::ToRivetSqliteCommitStageSegmentRequest(_)
+		| p::ToRivet::ToRivetSqliteCommitFinalizeRequest(_))
+}
+
+fn refusal_hint(keeps_stage: bool, error: &anyhow::Error) -> Option<u64> {
+	let error = error.downcast_ref::<depot_client::filesystem::Error>()?;
+	if keeps_stage || *error == depot_client::filesystem::Error::ColdReadRefused {
+		error.retry_after_ms()
+	} else {
+		None
+	}
 }
 
 async fn execute_inner(

@@ -5,7 +5,6 @@ mod remote;
 mod routing;
 mod trace_scope;
 use anyhow::{Context, Result, ensure};
-use depot_volume::volume_client_machine::types::ErrorDisposition;
 use pegboard::epoch::{wrapping_ge, wrapping_gt, wrapping_le, wrapping_lt, wrapping_max};
 use pegboard::keys::partition::ActorDatabaseVolume;
 use rivet_envoy_protocol as p;
@@ -1435,7 +1434,7 @@ pub(super) async fn execute_pages(
 			}
 			Err(error) => error,
 		};
-		let Some(hint_ms) = refused_page_request_hint_ms(&message, &error) else {
+		let Some(hint_ms) = page_protocol::retry_after_ms(&message, &error) else {
 			return Err(error);
 		};
 		let backoff = match &mut backoff {
@@ -1457,54 +1456,6 @@ pub(super) async fn execute_pages(
 			"actor SQLite page request refused; sending it again"
 		);
 	}
-}
-
-/// The hint of a page request that depot refused without running it, or `None` for every other
-/// error. A cold read refusal qualifies for any page request. A write refusal qualifies only for
-/// a single-request commit: a staged commit's refused write does not keep its stage, so it
-/// returns to the runtime, which restarts the transaction.
-fn refused_page_request_hint_ms(message: &p::ToRivet, error: &anyhow::Error) -> Option<u64> {
-	if let Some(hint_ms) = refused_cold_read_hint_ms(error) {
-		return Some(hint_ms);
-	}
-	match message {
-		p::ToRivet::ToRivetSqliteCommitRequest(_) => refused_write_hint_ms(error),
-		_ => None,
-	}
-}
-
-/// The hint of a write the volume client refused with a hint before dispatching it, such as the
-/// shards' overload. Nothing took a position in the log, so the identical commit may be sent
-/// again; a fence that lands meanwhile fails the resend on the filesystem's own status check.
-/// A refusal of an admitted write never reaches here as `NotExecuted`, because the filesystem
-/// reports it as outcome unknown. A refusal without a hint, such as an entry that is too large,
-/// would be refused the same way and returns at once.
-///
-/// A write the selected entry version cannot carry, and a write refused because the volume's
-/// admitted writes are too far ahead of its tablet's apply, were refused at admission too, so
-/// they qualify the same way.
-fn refused_write_hint_ms(error: &anyhow::Error) -> Option<u64> {
-	match error.downcast_ref::<depot_client::filesystem::Error>() {
-		Some(
-			depot_client::filesystem::Error::VersionUnavailable { retry_after_ms }
-			| depot_client::filesystem::Error::ApplyBacklog { retry_after_ms },
-		) => Some(*retry_after_ms),
-		Some(depot_client::filesystem::Error::Log(error))
-			if error.disposition() == ErrorDisposition::NotExecuted =>
-		{
-			error.retry_after_ms()
-		}
-		Some(_) | None => None,
-	}
-}
-
-/// The hint of a page request whose cold read the tablet's maintainer refused, or `None` for
-/// every other error.
-fn refused_cold_read_hint_ms(error: &anyhow::Error) -> Option<u64> {
-	if !page_protocol::refused_without_running(error) {
-		return None;
-	}
-	depot_client::retry_after_ms(error)
 }
 
 /// The hint of an open that depot refused without running it, or `None` when it may have run

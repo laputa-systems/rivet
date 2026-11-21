@@ -102,24 +102,24 @@ pub(super) async fn execute(
 						.all(|(&start, old)| last < start || req.data.first_pgno > old.last_pgno),
 					"overlapping SQLite segments"
 				);
-				for page in &req.data.dirty_pages {
-					pages
-						.prefetcher
-						.add_dirty(&mut stage.prefetch, page.pgno, &page.bytes);
-				}
 				let edits = req
 					.data
 					.dirty_pages
-					.into_iter()
+					.iter()
 					.map(|p| {
 						FileEdit::Write(FileWrite {
 							offset: u64::from(p.pgno - 1) * PAGE as u64,
-							bytes: p.bytes,
+							bytes: p.bytes.clone(),
 						})
 					})
 					.collect::<Vec<_>>();
 				// Admission is sufficient: the final commit ticket covers every segment.
 				stage.transaction.edit_file(pages.ino, &edits).await?;
+				for page in &req.data.dirty_pages {
+					pages
+						.prefetcher
+						.add_dirty(&mut stage.prefetch, page.pgno, &page.bytes);
+				}
 				stage.bytes += bytes;
 				stage.segments.insert(
 					req.data.first_pgno,
@@ -168,16 +168,16 @@ pub(super) async fn execute(
 				// A commit refused before it was admitted keeps the stage, so the identical
 				// finalize commits it. After any other outcome the stage is done; dropping a
 				// transaction that did not commit aborts it once its outcome is known.
-				if !committed
-					.as_ref()
-					.is_err_and(|error| *error == depot_client::filesystem::Error::ColdReadRefused)
-				{
+				let refused = committed.as_ref().is_err_and(|error| error.retry_after_ms().is_some());
+				if !refused {
 					stage.take();
 				}
 				let seq = match committed {
 					Ok(seq) => seq,
 					Err(error) => {
-						pages.prefetcher.commit_failed();
+						if !refused {
+							pages.prefetcher.commit_failed();
+						}
 						return Err(error.into());
 					}
 				};

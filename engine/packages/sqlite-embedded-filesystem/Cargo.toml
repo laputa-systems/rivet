@@ -24,3 +24,9 @@ sqlite_types.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+depot-types.workspace = true
+depot-volume.workspace = true
+rivet-data.workspace = true
+vbare.workspace = true
+

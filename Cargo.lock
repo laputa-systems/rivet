@@ -6092,7 +6092,10 @@ dependencies = [
  "bytes",
  "depot-client",
  "depot-fs-core",
+ "depot-types",
+ "depot-volume",
  "futures-util",
+ "rivet-data",
  "rivet-env",
  "rivet-envoy-protocol",
  "rivet-error",
@@ -6102,6 +6105,7 @@ dependencies = [
  "sqlite-prefetch",
  "tokio",
  "tracing",
+ "vbare",
 ]
 
 [[package]]
